@@ -131,10 +131,16 @@ def extract_json(value: object, file_id: str, captured: str, parent_system: str 
         rid = value.get("resource_id")
         if isinstance(rid, str):
             system = normalized(value.get("system_id") or value.get("service") or parent_system)
+            attributes = dict(value)
+            for nested in ("profile", "record", "data", "customer", "metadata"):
+                if isinstance(value.get(nested), dict):
+                    for k, v in value[nested].items():
+                        attributes.setdefault(k, v)
             yield {
                 "resource_id": rid, "system_id": system_for(rid, system),
-                "attributes": value, "timestamp": timepoint(value.get("observed_at") or
+                "attributes": attributes, "timestamp": timepoint(value.get("observed_at") or
                     value.get("updated_at") or value.get("event_time") or captured),
+                "captured_at": timepoint(captured),
                 "evidence_id": file_id,
             }
         for key, child in value.items():
@@ -163,13 +169,13 @@ def extract_sql(path: Path, file_id: str, captured: str):
                 yield {
                     "resource_id": str(rid), "system_id": system_for(str(rid), SYSTEMS.get(table, "")),
                     "attributes": obj, "timestamp": timepoint(obj.get("updated_at") or captured),
-                    "evidence_id": file_id,
+                    "captured_at": timepoint(captured), "evidence_id": file_id,
                 }
     finally:
         con.close()
 
 
-def extract_log(path: Path, file_id: str):
+def extract_log(path: Path, file_id: str, captured: str):
     kv = re.compile(r"([a-zA-Z_][a-zA-Z_0-9]*)=([^\s]+)")
     with path.open(encoding="utf-8", errors="replace") as stream:
         for line in stream:
@@ -187,7 +193,7 @@ def extract_log(path: Path, file_id: str):
                 "resource_id": rid,
                 "system_id": system_for(rid, attrs.get("service", "")),
                 "attributes": attrs, "timestamp": timestamp,
-                "evidence_id": file_id,
+                "captured_at": timepoint(captured), "evidence_id": file_id,
             }
 
 
@@ -205,7 +211,8 @@ def extract_pdf(path: Path, file_id: str, captured: str):
             rid = resource_match.group(0)
             yield {"resource_id": rid, "system_id": system_for(rid),
                    "attributes": {"text": line},
-                   "timestamp": timepoint(captured), "evidence_id": file_id}
+                   "timestamp": timepoint(captured), "captured_at": timepoint(captured),
+                   "evidence_id": file_id}
 
 
 def load_evidence(dataset: Path) -> list[dict]:
@@ -223,7 +230,7 @@ def load_evidence(dataset: Path) -> list[dict]:
             elif suffix == ".sql":
                 observed.extend(extract_sql(path, fid, stamp))
             elif suffix in (".txt", ".log"):
-                observed.extend(extract_log(path, fid))
+                observed.extend(extract_log(path, fid, stamp))
             elif suffix == ".pdf":
                 observed.extend(extract_pdf(path, fid, stamp))
         except (ValueError, UnicodeError, OSError, sqlite3.Error, subprocess.SubprocessError) as exc:
@@ -288,7 +295,7 @@ def action(phase: str, op: str, rec: dict, state: str, evidence: str) -> dict:
 
 
 def decide(request: dict, names: dict[str, set[str]], lookup: dict[str, str],
-           evidence: list[dict], links: dict[str, set[str]]) -> dict:
+           evidence: list[dict], links: dict[str, list[tuple[str, str]]]) -> dict:
     case_id = request["case_id"]
     if not is_deletion(request["request_text"]):
         return {"case_id": case_id, "deletion_status": "NOT_APPLICABLE", "steps_json": "[]"}
@@ -299,10 +306,12 @@ def decide(request: dict, names: dict[str, set[str]], lookup: dict[str, str],
     found: dict[tuple[str, str], dict] = {}
     for rec in evidence:
         stamp = rec["timestamp"]
-        if not stamp or stamp > audit:
+        if not stamp or stamp > audit or rec.get("captured_at", stamp) > audit:
             continue
         rid = rec["resource_id"]
-        if not (matches(rec["attributes"], aliases) or (uid and rid in links.get(uid, ()))):
+        linked = bool(uid) and any(rid == linked_id and when <= audit
+                                    for linked_id, when in links.get(uid, ()))
+        if not (matches(rec["attributes"], aliases) or linked):
             continue
         key = (rec["system_id"], rid)
         if key not in found or (stamp, rec["evidence_id"]) > (found[key]["timestamp"], found[key]["evidence_id"]):
@@ -342,14 +351,14 @@ def decide(request: dict, names: dict[str, set[str]], lookup: dict[str, str],
             "steps_json": json.dumps(steps, ensure_ascii=False, separators=(",", ":"))}
 
 
-def identity_links(dataset: Path) -> dict[str, set[str]]:
-    result: dict[str, set[str]] = defaultdict(set)
+def identity_links(dataset: Path) -> dict[str, list[tuple[str, str]]]:
+    result: dict[str, list[tuple[str, str]]] = defaultdict(list)
     for event in rows(dataset / "system_activity.csv"):
         if event.get("event_type") != "LINK_RESOURCE_IDENTITY":
             continue
         m = re.search(r"\buser_\d+\b", event.get("details", ""))
         if m:
-            result[m.group(0)].add(event["resource_id"])
+            result[m.group(0)].append((event["resource_id"], timepoint(event["event_time"])))
     return result
 
 
