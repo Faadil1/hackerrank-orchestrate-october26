@@ -54,7 +54,7 @@ NON_DELETION = (
 REQUEST_CUES = ("delet", "eras", "remov", "forget", "close my account", "closure",
                 "suppression", "supprim", "effac", "élimin", "elimin", "borrar",
                 "cancelar mi cuenta", "elimina", "apagar meus dados", "削除", "删除", "삭제",
-                "حذف", "beseitig", "lösch", "wissen", "apagar", "elimina",
+                "حذف", "beseitig", "lösch", "apagar", "elimina",
                 "record still", "anonymiz", "redact", "remove the rest")
 NOT_REQUEST = ("access request", "export my", "download my", "copy of my data",
                "correct my", "update my", "marketing opt", "unsubscribe",
@@ -251,6 +251,17 @@ def classification(record: dict) -> tuple[str, str, str]:
     rid = record["resource_id"]
     attr = record["attributes"]
     system = record["system_id"]
+    category = normalized(attr.get("data_category") or attr.get("category")).upper()
+    if category in {"USER_PROFILE", "SECONDARY_IDENTIFIER", "SEARCH_INDEX_ENTRY",
+                    "CACHE_ENTRY", "SUPPORT_ATTACHMENT", "USER_EXPORT", "MARKETING_PROFILE"}:
+        return ("DELETE_RECORD", "PRESENT", "VERIFY_RECORD_ABSENT")
+    if category in {"PRODUCT_TELEMETRY", "ANALYTICS_PROFILE"}:
+        anonymous = not any(normalized(attr.get(k)) not in ("", "null", "none")
+                            for k in ID_FIELDS)
+        return ("", "ANONYMIZED", "VERIFY_RECORD_ANONYMIZED") if anonymous else (
+            "ANONYMIZE_RECORD", "PRESENT", "VERIFY_RECORD_ANONYMIZED")
+    if category in {"LEGAL_HOLD_RECORD", "SECURITY_AUDIT_LOG"}:
+        return ("", "PRESENT", "VERIFY_RECORD_PRESENT")
     is_null = lambda v: normalized(v) in ("", "null", "none", "false")
     present_pii = any(not is_null(attr.get(key)) for key in (
         "email", "customer_email", "requester_email", "owner_email",
